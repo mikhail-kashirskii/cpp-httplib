@@ -449,6 +449,7 @@ struct Request {
   ContentProvider content_provider_;
   bool is_chunked_content_provider_ = false;
   size_t authorization_count_ = 0;
+  uint32_t status = 0;
 };
 
 struct Response {
@@ -606,6 +607,57 @@ using SocketOptions = std::function<void(socket_t sock)>;
 
 void default_socket_options(socket_t sock);
 
+namespace detail {
+class SocketStream : public Stream {
+public:
+  SocketStream(socket_t sock, time_t read_timeout_sec, time_t read_timeout_usec,
+               time_t write_timeout_sec, time_t write_timeout_usec);
+  ~SocketStream() override;
+
+  bool is_readable() const override;
+  bool is_writable() const override;
+  ssize_t read(char *ptr, size_t size) override;
+  ssize_t write(const char *ptr, size_t size) override;
+  void get_remote_ip_and_port(std::string &ip, int &port) const override;
+  socket_t socket() const override;
+
+private:
+  socket_t sock_;
+  time_t read_timeout_sec_;
+  time_t read_timeout_usec_;
+  time_t write_timeout_sec_;
+  time_t write_timeout_usec_;
+
+  std::vector<char> read_buff_;
+  size_t read_buff_off_ = 0;
+  size_t read_buff_content_size_ = 0;
+
+  static const size_t read_buff_size_ = 1024 * 4;
+};
+
+// NOTE: until the read size reaches `fixed_buffer_size`, use `fixed_buffer`
+// to store data. The call can set memory on stack for performance.
+class stream_line_reader {
+public:
+  stream_line_reader(Stream &strm, char *fixed_buffer,
+                     size_t fixed_buffer_size);
+  const char *ptr() const;
+  size_t size() const;
+  bool end_with_crlf() const;
+  bool getline();
+
+private:
+  void append(char c);
+
+  Stream &strm_;
+  char *fixed_buffer_;
+  const size_t fixed_buffer_size_;
+  size_t fixed_buffer_used_size_ = 0;
+  std::string glowable_buffer_;
+};
+
+}
+
 class Server {
 public:
   using Handler = std::function<void(const Request &, Response &)>;
@@ -696,7 +748,7 @@ public:
   std::function<TaskQueue *(void)> new_task_queue;
 
 protected:
-  bool process_request(Stream &strm, bool close_connection,
+  bool process_request(Stream &strm, Request& req, bool close_connection,
                        bool &connection_closed,
                        const std::function<void(Request &)> &setup_request);
 
@@ -755,7 +807,8 @@ private:
                          MultipartContentHeader mulitpart_header,
                          ContentReceiver multipart_receiver);
 
-  virtual bool process_and_close_socket(socket_t sock);
+
+  virtual bool process_and_close_socket(socket_t sock, Request& req, detail::SocketStream& strm);
 
   struct MountPointEntry {
     std::string mount_point;
@@ -1445,7 +1498,7 @@ public:
   SSL_CTX *ssl_context() const;
 
 private:
-  bool process_and_close_socket(socket_t sock) override;
+  bool process_and_close_socket(socket_t sock, Request& req, detail::SocketStream& strm) override;
 
   SSL_CTX *ctx_;
   std::mutex ctx_mutex_;
@@ -1859,27 +1912,6 @@ private:
   BrotliDecoderState *decoder_s = nullptr;
 };
 #endif
-
-// NOTE: until the read size reaches `fixed_buffer_size`, use `fixed_buffer`
-// to store data. The call can set memory on stack for performance.
-class stream_line_reader {
-public:
-  stream_line_reader(Stream &strm, char *fixed_buffer,
-                     size_t fixed_buffer_size);
-  const char *ptr() const;
-  size_t size() const;
-  bool end_with_crlf() const;
-  bool getline();
-
-private:
-  void append(char c);
-
-  Stream &strm_;
-  char *fixed_buffer_;
-  const size_t fixed_buffer_size_;
-  size_t fixed_buffer_used_size_ = 0;
-  std::string glowable_buffer_;
-};
 
 } // namespace detail
 
@@ -2421,33 +2453,6 @@ inline bool is_socket_alive(socket_t sock) {
   return detail::read_socket(sock, &buf[0], sizeof(buf), MSG_PEEK) > 0;
 }
 
-class SocketStream : public Stream {
-public:
-  SocketStream(socket_t sock, time_t read_timeout_sec, time_t read_timeout_usec,
-               time_t write_timeout_sec, time_t write_timeout_usec);
-  ~SocketStream() override;
-
-  bool is_readable() const override;
-  bool is_writable() const override;
-  ssize_t read(char *ptr, size_t size) override;
-  ssize_t write(const char *ptr, size_t size) override;
-  void get_remote_ip_and_port(std::string &ip, int &port) const override;
-  socket_t socket() const override;
-
-private:
-  socket_t sock_;
-  time_t read_timeout_sec_;
-  time_t read_timeout_usec_;
-  time_t write_timeout_sec_;
-  time_t write_timeout_usec_;
-
-  std::vector<char> read_buff_;
-  size_t read_buff_off_ = 0;
-  size_t read_buff_content_size_ = 0;
-
-  static const size_t read_buff_size_ = 1024 * 4;
-};
-
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 class SSLSocketStream : public Stream {
 public:
@@ -2514,6 +2519,7 @@ process_server_socket_core(const std::atomic<socket_t> &svr_sock, socket_t sock,
 template <typename T>
 inline bool
 process_server_socket(const std::atomic<socket_t> &svr_sock, socket_t sock,
+          Request& req, detail::SocketStream& strm,
                       size_t keep_alive_max_count,
                       time_t keep_alive_timeout_sec, time_t read_timeout_sec,
                       time_t read_timeout_usec, time_t write_timeout_sec,
@@ -2521,9 +2527,7 @@ process_server_socket(const std::atomic<socket_t> &svr_sock, socket_t sock,
   return process_server_socket_core(
       svr_sock, sock, keep_alive_max_count, keep_alive_timeout_sec,
       [&](bool close_connection, bool &connection_closed) {
-        SocketStream strm(sock, read_timeout_sec, read_timeout_usec,
-                          write_timeout_sec, write_timeout_usec);
-        return callback(strm, close_connection, connection_closed);
+        return callback(strm, req, close_connection, connection_closed);
       });
 }
 
@@ -5415,11 +5419,14 @@ inline bool Server::listen_internal() {
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(tv));
 #endif
       }
-
+    detail::SocketStream strm(sock, read_timeout_sec_, read_timeout_usec_,
+                          write_timeout_sec_, write_timeout_usec_);
+    Request req;
+    //AAAA
 #if __cplusplus > 201703L
-      task_queue->enqueue([=, this]() { process_and_close_socket(sock); });
+      task_queue->enqueue([&, this]() { process_and_close_socket(sock, req, strm); });
 #else
-      task_queue->enqueue([=]() { process_and_close_socket(sock); });
+      task_queue->enqueue([&]() { process_and_close_socket(sock, req, strm); });
 #endif
     }
 
@@ -5647,17 +5654,24 @@ inline bool Server::dispatch_request_for_content_reader(
 }
 
 inline bool
-Server::process_request(Stream &strm, bool close_connection,
+Server::process_request(Stream &strm, Request& req, bool close_connection,
                         bool &connection_closed,
                         const std::function<void(Request &)> &setup_request) {
-  std::array<char, 2048> buf{};
+    std::array<char, 2048> buf{};
+    detail::stream_line_reader line_reader(strm, buf.data(), buf.size());
+    if (!line_reader.getline()) { return false; }
 
-  detail::stream_line_reader line_reader(strm, buf.data(), buf.size());
+    // Request line and headers
+    if (!parse_request_line(line_reader.ptr(), req) ||
+        !detail::read_headers(strm, req.headers)) {
+            req.status = 400;
+        }
 
-  // Connection has been closed on client
-  if (!line_reader.getline()) { return false; }
+    for (auto& t : req.headers)
+        std::cout << t.first << " " 
+                  << t.second <<  "\n";    
 
-  Request req;
+
   Response res;
 
   res.version = "HTTP/1.1";
@@ -5674,25 +5688,13 @@ Server::process_request(Stream &strm, bool close_connection,
 #ifndef CPPHTTPLIB_USE_POLL
   // Socket file descriptor exceeded FD_SETSIZE...
   if (strm.socket() >= FD_SETSIZE) {
-    Headers dummy;
-    detail::read_headers(strm, dummy);
     res.status = 500;
     return write_response(strm, close_connection, req, res);
   }
 #endif
 #endif
 
-  // Check if the request URI doesn't exceed the limit
-  if (line_reader.size() > CPPHTTPLIB_REQUEST_URI_MAX_LENGTH) {
-    Headers dummy;
-    detail::read_headers(strm, dummy);
-    res.status = 414;
-    return write_response(strm, close_connection, req, res);
-  }
-
-  // Request line and headers
-  if (!parse_request_line(line_reader.ptr(), req) ||
-      !detail::read_headers(strm, req.headers)) {
+  if(req.status == 400) {
     res.status = 400;
     return write_response(strm, close_connection, req, res);
   }
@@ -5741,6 +5743,7 @@ Server::process_request(Stream &strm, bool close_connection,
   routed = routing(req, res, strm);
 #else
   try {
+    std::cout << req.path << std::endl << std::flush;
     routed = routing(req, res, strm);
   } catch (std::exception &e) {
     if (exception_handler_) {
@@ -5774,13 +5777,13 @@ Server::process_request(Stream &strm, bool close_connection,
 
 inline bool Server::is_valid() const { return true; }
 
-inline bool Server::process_and_close_socket(socket_t sock) {
+inline bool Server::process_and_close_socket(socket_t sock, Request& req, detail::SocketStream& strm) {
   auto ret = detail::process_server_socket(
-      svr_sock_, sock, keep_alive_max_count_, keep_alive_timeout_sec_,
+      svr_sock_, sock, req, strm, keep_alive_max_count_, keep_alive_timeout_sec_,
       read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
       write_timeout_usec_,
-      [this](Stream &strm, bool close_connection, bool &connection_closed) {
-        return process_request(strm, close_connection, connection_closed,
+      [this](Stream &strm, Request& req, bool close_connection, bool &connection_closed) {
+        return process_request(strm, req, close_connection, connection_closed,
                                nullptr);
       });
 
@@ -7411,7 +7414,7 @@ inline bool SSLServer::is_valid() const { return ctx_; }
 
 inline SSL_CTX *SSLServer::ssl_context() const { return ctx_; }
 
-inline bool SSLServer::process_and_close_socket(socket_t sock) {
+inline bool SSLServer::process_and_close_socket(socket_t sock, Request& req, detail::SocketStream& strm) {
   auto ssl = detail::ssl_new(
       sock, ctx_, ctx_mutex_,
       [&](SSL *ssl2) {
@@ -7423,12 +7426,12 @@ inline bool SSLServer::process_and_close_socket(socket_t sock) {
   bool ret = false;
   if (ssl) {
     ret = detail::process_server_socket_ssl(
-        svr_sock_, ssl, sock, keep_alive_max_count_, keep_alive_timeout_sec_,
+        svr_sock_, ssl, req, sock, keep_alive_max_count_, keep_alive_timeout_sec_,
         read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
         write_timeout_usec_,
-        [this, ssl](Stream &strm, bool close_connection,
+        [this, ssl](Stream &strm, Request& req, bool close_connection,
                     bool &connection_closed) {
-          return process_request(strm, close_connection, connection_closed,
+          return process_request(strm, req, close_connection, connection_closed,
                                  [&](Request &req) { req.ssl = ssl; });
         });
 

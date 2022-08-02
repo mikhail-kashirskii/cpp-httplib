@@ -5443,7 +5443,7 @@ inline bool Server::listen_internal() {
         }
 
       #if __cplusplus > 201703L
-            task_queue->enqueue([&, this]() { process_and_close_socket(sock, req, strm); });
+            task_queue->enqueue(prio, [=, this]() mutable { process_and_close_socket(sock, req, strm); });
       #else
             task_queue->enqueue(prio, [=]() mutable { process_and_close_socket(sock, req, strm); });
       #endif

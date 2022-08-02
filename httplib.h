@@ -5700,8 +5700,8 @@ Server::process_request(Stream &strm, Request& req, bool close_connection,
 #endif
 #endif
 
-  if(req.status == 400) {
-    res.status = 400;
+  if(req.status >= 400) {
+    res.status = req.status;
     return write_response(strm, close_connection, req, res);
   }
 

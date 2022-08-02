@@ -5425,21 +5425,29 @@ inline bool Server::listen_internal() {
     Request req;
     std::array<char, 2048> buf{};
     detail::stream_line_reader line_reader(strm, buf.data(), buf.size());
-    if (!line_reader.getline()) { return false; }
-
-    // Request line and headers
-    if (!parse_request_line(line_reader.ptr(), req) ||
-        !detail::read_headers(strm, req.headers)) {
-            req.status = 400;
+    size_t prio = 1;
+    if (line_reader.getline()) { 
+      if (line_reader.size() > CPPHTTPLIB_REQUEST_URI_MAX_LENGTH) {
+        req.status = 414;
+        detail::read_headers(strm, req.headers);
+      } else {
+          // Request line and headers
+          if (!parse_request_line(line_reader.ptr(), req) ||
+              !detail::read_headers(strm, req.headers)) {
+                  req.status = 400;
+              } else {
+                if ( req.path == "/status") {
+                  prio = 0;
+                }
+              }
         }
 
-    size_t prio = req.path == "/status" ? 0 : 1;
-
-#if __cplusplus > 201703L
-      task_queue->enqueue([&, this]() { process_and_close_socket(sock, req, strm); });
-#else
-      task_queue->enqueue(prio, [=]() mutable { process_and_close_socket(sock, req, strm); });
-#endif
+      #if __cplusplus > 201703L
+            task_queue->enqueue([&, this]() { process_and_close_socket(sock, req, strm); });
+      #else
+            task_queue->enqueue(prio, [=]() mutable { process_and_close_socket(sock, req, strm); });
+      #endif
+      }
     }
 
     task_queue->shutdown();

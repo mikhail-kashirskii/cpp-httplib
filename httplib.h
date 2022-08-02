@@ -92,7 +92,7 @@
 
 #ifndef CPPHTTPLIB_THREAD_POOL_COUNT
 #define CPPHTTPLIB_THREAD_POOL_COUNT                                           \
-  ((std::max)(8u, std::thread::hardware_concurrency() > 0                      \
+  ((std::max)(1u, std::thread::hardware_concurrency() > 0                      \
                       ? std::thread::hardware_concurrency() - 1                \
                       : 0))
 #endif
@@ -525,7 +525,7 @@ public:
   TaskQueue() = default;
   virtual ~TaskQueue() = default;
 
-  virtual void enqueue(std::function<void()> fn) = 0;
+  virtual void enqueue(size_t, std::function<void()> fn) = 0;
   virtual void shutdown() = 0;
 
   virtual void on_idle() {}
@@ -543,9 +543,12 @@ public:
   ThreadPool(const ThreadPool &) = delete;
   ~ThreadPool() override = default;
 
-  void enqueue(std::function<void()> fn) override {
+  void enqueue(size_t prio, std::function<void()> fn) override {
     std::unique_lock<std::mutex> lock(mutex_);
-    jobs_.push_back(std::move(fn));
+    if (prio==0) 
+      jobs_.push_front(std::move(fn));
+    else
+      jobs_.push_back(std::move(fn));
     cond_.notify_one();
   }
 
@@ -2505,8 +2508,7 @@ process_server_socket_core(const std::atomic<socket_t> &svr_sock, socket_t sock,
   assert(keep_alive_max_count > 0);
   auto ret = false;
   auto count = keep_alive_max_count;
-  while (svr_sock != INVALID_SOCKET && count > 0 &&
-         keep_alive(sock, keep_alive_timeout_sec)) {
+  while (svr_sock != INVALID_SOCKET && count > 0) {
     auto close_connection = count == 1;
     auto connection_closed = false;
     ret = callback(close_connection, connection_closed);
@@ -5419,14 +5421,24 @@ inline bool Server::listen_internal() {
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(tv));
 #endif
       }
-    detail::SocketStream strm(sock, read_timeout_sec_, read_timeout_usec_,
-                          write_timeout_sec_, write_timeout_usec_);
+    detail::SocketStream strm(sock, read_timeout_sec_, read_timeout_usec_,write_timeout_sec_, write_timeout_usec_);
     Request req;
-    //AAAA
+    std::array<char, 2048> buf{};
+    detail::stream_line_reader line_reader(strm, buf.data(), buf.size());
+    if (!line_reader.getline()) { return false; }
+
+    // Request line and headers
+    if (!parse_request_line(line_reader.ptr(), req) ||
+        !detail::read_headers(strm, req.headers)) {
+            req.status = 400;
+        }
+
+    size_t prio = req.path == "/status" ? 0 : 1;
+
 #if __cplusplus > 201703L
       task_queue->enqueue([&, this]() { process_and_close_socket(sock, req, strm); });
 #else
-      task_queue->enqueue([&]() { process_and_close_socket(sock, req, strm); });
+      task_queue->enqueue(prio, [=]() mutable { process_and_close_socket(sock, req, strm); });
 #endif
     }
 
@@ -5657,20 +5669,6 @@ inline bool
 Server::process_request(Stream &strm, Request& req, bool close_connection,
                         bool &connection_closed,
                         const std::function<void(Request &)> &setup_request) {
-    std::array<char, 2048> buf{};
-    detail::stream_line_reader line_reader(strm, buf.data(), buf.size());
-    if (!line_reader.getline()) { return false; }
-
-    // Request line and headers
-    if (!parse_request_line(line_reader.ptr(), req) ||
-        !detail::read_headers(strm, req.headers)) {
-            req.status = 400;
-        }
-
-    for (auto& t : req.headers)
-        std::cout << t.first << " " 
-                  << t.second <<  "\n";    
-
 
   Response res;
 
